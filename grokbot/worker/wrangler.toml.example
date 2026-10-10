@@ -1,0 +1,14 @@
+# 复制为 wrangler.toml。account_id 不用写死，wrangler login 后自动选择；如需指定:
+# account_id = "<your-cloudflare-account-id>"
+name = "<worker-name>"
+main = "index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]

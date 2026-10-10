@@ -1,0 +1,116 @@
+# 推 v* 标签 → 打包 muse-bridge.tgz、生成校验和与更新频道 latest.json、创建 GitHub Release。
+#   正式版和 beta（v0.2.0、v0.2.0-beta.1）：标成 latest，latest.json 走 releases/latest/download/，
+#     已装的 Muse 每 6 小时读一次，发现新版本就问用户。（GitHub 的 latest 不认预发布——beta 要是标成预发布，
+#     更新频道和 README 里的安装地址就全是 404。）
+#   试装版（标签里带 -test，如 v0.2.0-test.1）：发成预发布，不进 latest，用 Release 里附的 muse-prompt.txt 在新 Muse 上试装。
+# 安卓 app（android/）同一次构建：apk 附在 Release 上，也放进安装包的 downloads/，由各台 Muse 上的服务器自己提供下载。
+#   签名密钥放在仓库的 Actions secrets 里（ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD），
+#   没配（比如 fork）就用 debug 签名，照样能装，只是不能覆盖安装官方发布的包。
+# 更新内容取带说明的标签（git tag -a v0.2.0 -m "…"）的说明；轻量标签就用最后一次提交的标题。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 说明书跟界面对不上（编了按钮、漏了子命令、设置分区没写）就不发版：Muse 回答用户靠它
+      - name: Check the Muse guide
+        run: node --test deploy/muse/test/guide.test.mjs
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build Android app
+        env:
+          TAG: ${{ github.ref_name }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          MB_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MB_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MB_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            export MB_KEYSTORE="$RUNNER_TEMP/release.keystore"
+          else
+            echo "::warning::没有配置安卓签名密钥，apk 用 debug 签名"
+          fi
+          # versionCode = 提交数：只增不减，覆盖安装才不会被系统拒
+          CODE="$(git rev-list --count HEAD)"
+          gradle -p android --no-daemon assembleRelease -PmbVersionCode="$CODE" -PmbVersionName="${TAG#v}"
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/MuseBridge.apk
+          jq -n --arg name "${TAG#v}" --argjson code "$CODE" --arg sha256 "$(sha256sum dist/MuseBridge.apk | cut -d' ' -f1)"             '{versionName:$name, versionCode:$code, sha256:$sha256}' > dist/android.json
+          rm -f "$RUNNER_TEMP/release.keystore"
+
+      - name: Package
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags
+          mkdir -p dist/stage
+          # git archive 会按 .gitattributes 的 export-subst 把 deploy/muse/VERSION 填成「短哈希 日期」
+          git archive --format=tar --prefix=bridge/ HEAD | tar -x -C dist/stage
+          # 安卓 app 随安装包走：服务器的 /download/MuseBridge.apk 读这里（src/routes/android-app.mjs）
+          mkdir -p dist/stage/bridge/downloads
+          cp dist/MuseBridge.apk dist/android.json dist/stage/bridge/downloads/
+          printf '# 发布频道（发版时写入）\n%s\n' "https://github.com/$REPO/releases/latest/download/latest.json" \
+            > dist/stage/bridge/deploy/muse/CHANNEL
+          tar -czf dist/muse-bridge.tgz -C dist/stage bridge
+          cd dist
+          SHA="$(sha256sum muse-bridge.tgz | cut -d' ' -f1)"
+          echo "$SHA  muse-bridge.tgz" > muse-bridge.tgz.sha256
+          VERSION="$(head -1 stage/bridge/deploy/muse/VERSION)"
+          COMMIT="${VERSION%% *}"
+          NOTES="$(git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/^-----BEGIN PGP/,$d')"
+          [ -n "${NOTES// /}" ] || NOTES="$(git log -1 --format=%s)"
+          printf '%s\n' "$NOTES" > notes.md
+          # 这个版本修掉的 Issue：上个标签以来的提交说明 + 标签说明里写的「fixes #12 / 修复 #12」。
+          # 写进 latest.json 的 fixed，看门狗发现新版本时据此告诉用户「你报告过的 #12 在新版本里修好了」
+          PREV="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+          FIXED="$( { git log --format=%B ${PREV:+$PREV..}"$TAG"; printf '%s\n' "$NOTES"; } \
+            | { grep -oiE '(fix(e[sd])?|close[sd]?|resolve[sd]?|修复|修好|关闭) *#[0-9]+' || true; } | { grep -oE '[0-9]+' || true; } | sort -un \
+            | jq -R 'tonumber' | jq -sc . )"
+          echo "fixed issues: $FIXED"
+          # 已知问题（deploy/muse/known-issues.json 换算成受影响版本的提交哈希）：看门狗存下来，Muse 判断是不是 bug 前先查。
+          # 发版之后只改清单不发版：known-issues.yml 会单独改写最新 Release 的 latest.json
+          KNOWN="$(node "$GITHUB_WORKSPACE/.github/scripts/known-issues.mjs")"
+          jq -n --arg version "$TAG ($VERSION)" --arg commit "$COMMIT" \
+            --arg url "https://github.com/$REPO/releases/download/$TAG/muse-bridge.tgz" \
+            --arg sha256 "$SHA" --arg notes "$NOTES" --arg released "$(date -u +%FT%TZ)" --argjson fixed "${FIXED:-[]}" \
+            --argjson known "$KNOWN" \
+            '{version:$version, commit:$commit, url:$url, sha256:$sha256, notes:$notes, released:$released, fixed:$fixed, known_issues:$known}' > latest.json
+          # 这个版本专用的开场提示词（下载地址钉在本标签上，预发布试装用）
+          sed "s|{{BASE}}|https://github.com/$REPO/releases/download/$TAG|g" \
+            stage/bridge/deploy/muse/开场提示词.md > muse-prompt.txt
+          rm -rf stage
+          ls -la
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          pre="--latest"; case "$TAG" in *-test*) pre="--prerelease --latest=false" ;; esac
+          gh release create "$TAG" dist/muse-bridge.tgz dist/muse-bridge.tgz.sha256 dist/latest.json dist/muse-prompt.txt dist/MuseBridge.apk \
+            --title "$TAG" --notes-file dist/notes.md $pre

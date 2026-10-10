@@ -1,0 +1,7 @@
+bridge.env
+relay.secret
+*.log
+node_modules/
+worker/wrangler.toml
+worker/.wrangler/
+worker/.dev.vars
